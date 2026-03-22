@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASCII 3D Shape Viewer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.css" crossorigin="anonymous">
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0/lib/addon-webgl.js" crossorigin="anonymous"></script>
+<style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #1a1b26; overflow: hidden; }
+    #terminal { width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<div id="terminal"></div>
+<script>
+// Set up xterm.js FIRST
+var term = new Terminal({
+    theme: { background: '#1a1b26', foreground: '#c0caf5' },
+    fontSize: 14,
+    fontFamily: 'monospace',
+    cursorBlink: false,
+    scrollback: 0,
+    allowTransparency: false,
+});
+var fitAddon = new FitAddon.FitAddon();
+term.loadAddon(fitAddon);
+term.open(document.getElementById('terminal'));
+fitAddon.fit();
+// WebGL renderer addon — 3-5x faster rendering
+try {
+    var webglAddon = new WebglAddon.WebglAddon();
+    webglAddon.onContextLoss(function() { webglAddon.dispose(); });
+    term.loadAddon(webglAddon);
+    console.log('xterm WebGL renderer active');
+} catch(e) {
+    console.warn('WebGL renderer unavailable, using default:', e);
+}
+// Global function called by C code via EM_ASM
+window.writeToTerminal = function(data) {
+    term.write(data);
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// WebGL Black Hole GPU Renderer
+// ═══════════════════════════════════════════════════════════════════════
+
+var bhGl = null, bhProgram = null, bhFBO = null, bhTex = null, bhVBO = null;
+var bhPrevW = 0, bhPrevH = 0;
+
+var BH_VERT_SRC = 'attribute vec2 a_pos; void main(){gl_Position=vec4(a_pos,0.0,1.0);}';
+
+var BH_FRAG_SRC = [
+'precision highp float;',
+'uniform vec2 u_resolution;',
+'uniform vec3 u_cam_pos, u_cam_fwd, u_cam_right, u_cam_up;',
+'uniform vec2 u_fov;',
+'uniform vec2 u_cols_rows;',
+'uniform float u_disk_time;',
+'#define BH_RS 1.0',
+'#define R_ISCO 3.0',
+'#define R_OUTER 12.0',
+'vec3 blackbody(float temp){',
+'  temp=clamp(temp,0.0,1.0);',
+'  if(temp<0.33){float t=temp/0.33;return vec3(0.5+0.5*t,0.1*t*t,0.0);}',
+'  else if(temp<0.66){float t=(temp-0.33)/0.33;return vec3(1.0,0.1+0.7*t,0.05+0.3*t*t);}',
+'  else{float t=(temp-0.66)/0.34;return vec3(1.0-0.15*t,0.8+0.2*t,0.35+0.65*t);}',
+'}',
+'void main(){',
+'  float sx=gl_FragCoord.x-0.5;',
+'  float sy=(u_resolution.y-gl_FragCoord.y)-0.5;',
+'  float u=(2.0*(sx/2.0)-u_cols_rows.x)/u_cols_rows.x;',
+'  float v=(u_cols_rows.y-2.0*(sy/3.0))/u_cols_rows.y;',
+'  u+=(mod(sx,2.0)<1.0?-0.25:0.25)/u_cols_rows.x;',
+'  v+=((2.0-mod(sy,3.0))-1.0)*0.333/u_cols_rows.y;',
+'  vec3 dir=u_cam_fwd+u*u_fov.x*u_cam_right+v*u_fov.y*u_cam_up;',
+'  vec3 pos=u_cam_pos;',
+'  vec3 vel=normalize(dir);',
+'  float dt=0.25;',
+'  float r=length(pos);',
+'  vec3 h=cross(pos,vel);',
+'  float f=-1.5*dot(h,h)/(r*r*r*r*r);',
+'  vec3 acc=f*pos/r;',
+'  vec3 total_color=vec3(0.0);',
+'  float total_lum=0.0;',
+'  for(int step=0;step<150;step++){',
+'    float prev_y=pos.y;',
+'    pos+=vel*dt+0.5*acc*dt*dt;',
+'    r=length(pos);',
+'    if(r<BH_RS)break;',
+'    h=cross(pos,vel);',
+'    f=-1.5*dot(h,h)/(r*r*r*r*r);',
+'    vec3 acc2=f*pos/r;',
+'    vel+=0.5*(acc+acc2)*dt;',
+'    acc=acc2;',
+'    if(prev_y*pos.y<=0.0&&(prev_y!=0.0||pos.y!=0.0)){',
+'      float frac=abs(prev_y)/(abs(prev_y)+abs(pos.y)+1e-12);',
+'      float cx=pos.x-vel.x*dt*(1.0-frac);',
+'      float cz=pos.z-vel.z*dt*(1.0-frac);',
+'      float cr=sqrt(cx*cx+cz*cz);',
+'      if(cr>=R_ISCO&&cr<=R_OUTER){',
+'        float brightness=sqrt(R_ISCO/cr);',
+'        float phi=atan(cz,cx)+u_disk_time;',
+'        float doppler=1.0+0.35*sin(phi);',
+'        float band=0.85+0.15*sin(cr*3.0-u_disk_time*2.0);',
+'        float spiral=0.9+0.1*sin(phi*2.0-cr*0.8+u_disk_time*1.5);',
+'        float lum=clamp(brightness*doppler*band*spiral,0.0,1.0);',
+'        float temp=clamp(brightness+0.15*sin(phi),0.0,1.0);',
+'        total_color+=blackbody(temp)*lum;',
+'        total_lum+=lum;',
+'        if(total_lum>1.5)break;',
+'      }',
+'    }',
+'    if(r>50.0)break;',
+'  }',
+'  if(total_lum>1.0){total_color/=total_lum;total_lum=1.0;}',
+'  gl_FragColor=vec4(total_color,total_lum);',
+'}'
+].join('\n');
+
+function initBhGl() {
+    if (bhGl) return true;
+    var canvas = document.createElement('canvas');
+    bhGl = canvas.getContext('webgl', { antialias: false, depth: false, stencil: false });
+    if (!bhGl) return false;
+    var gl = bhGl;
+
+    function compile(type, src) {
+        var s = gl.createShader(type);
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+            console.error('BH shader error:', gl.getShaderInfoLog(s));
+            return null;
+        }
+        return s;
+    }
+    var vs = compile(gl.VERTEX_SHADER, BH_VERT_SRC);
+    var fs = compile(gl.FRAGMENT_SHADER, BH_FRAG_SRC);
+    if (!vs || !fs) return false;
+
+    bhProgram = gl.createProgram();
+    gl.attachShader(bhProgram, vs);
+    gl.attachShader(bhProgram, fs);
+    gl.bindAttribLocation(bhProgram, 0, 'a_pos');
+    gl.linkProgram(bhProgram);
+    if (!gl.getProgramParameter(bhProgram, gl.LINK_STATUS)) {
+        console.error('BH program link error:', gl.getProgramInfoLog(bhProgram));
+        return false;
+    }
+
+    bhVBO = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, bhVBO);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+
+    bhTex = gl.createTexture();
+    bhFBO = gl.createFramebuffer();
+    return true;
+}
+
+/* Read BHParams struct from WASM heap.
+ * Layout: 15 floats (cam/fwd/right/up/ax/ay/diskTime) then 3 ints (cols/rows/hc).
+ * Float offset = ptr >> 2, ints at float offset + 15 (read as int32). */
+function readBHParams(ptr) {
+    var f = ptr >> 2;
+    var p = {};
+    p.camX = Module.HEAPF32[f+0]; p.camY = Module.HEAPF32[f+1]; p.camZ = Module.HEAPF32[f+2];
+    p.fwdX = Module.HEAPF32[f+3]; p.fwdY = Module.HEAPF32[f+4]; p.fwdZ = Module.HEAPF32[f+5];
+    p.rightX = Module.HEAPF32[f+6]; p.rightY = Module.HEAPF32[f+7]; p.rightZ = Module.HEAPF32[f+8];
+    p.upX = Module.HEAPF32[f+9]; p.upY = Module.HEAPF32[f+10]; p.upZ = Module.HEAPF32[f+11];
+    p.ax = Module.HEAPF32[f+12]; p.ay = Module.HEAPF32[f+13]; p.diskTime = Module.HEAPF32[f+14];
+    p.cols = Module.HEAP32[f+15]; p.rows = Module.HEAP32[f+16]; p.hc = Module.HEAP32[f+17];
+    return p;
+}
+
+window.bhGpuRender = function(bhPtr, pixPtr) {
+    if (!initBhGl()) return 0;
+    var gl = bhGl;
+    var p = readBHParams(bhPtr);
+    var w = p.hc, h = p.rows * 3;
+
+    if (w !== bhPrevW || h !== bhPrevH) {
+        gl.canvas.width = w;
+        gl.canvas.height = h;
+        gl.bindTexture(gl.TEXTURE_2D, bhTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, bhFBO);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, bhTex, 0);
+        bhPrevW = w; bhPrevH = h;
+    }
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, bhFBO);
+    gl.viewport(0, 0, w, h);
+    gl.useProgram(bhProgram);
+
+    var u = function(name) { return gl.getUniformLocation(bhProgram, name); };
+    gl.uniform2f(u('u_resolution'), w, h);
+    gl.uniform3f(u('u_cam_pos'), p.camX, p.camY, p.camZ);
+    gl.uniform3f(u('u_cam_fwd'), p.fwdX, p.fwdY, p.fwdZ);
+    gl.uniform3f(u('u_cam_right'), p.rightX, p.rightY, p.rightZ);
+    gl.uniform3f(u('u_cam_up'), p.upX, p.upY, p.upZ);
+    gl.uniform2f(u('u_fov'), p.ax, p.ay);
+    gl.uniform2f(u('u_cols_rows'), p.cols, p.rows);
+    gl.uniform1f(u('u_disk_time'), p.diskTime);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, bhVBO);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    var pixels = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+
+    /* WebGL y=0 is bottom, we need y=0 at top — flip rows */
+    var rowBytes = w * 4;
+    var tmp = new Uint8Array(rowBytes);
+    for (var r = 0; r < Math.floor(h / 2); r++) {
+        var top = r * rowBytes;
+        var bot = (h - 1 - r) * rowBytes;
+        tmp.set(pixels.subarray(top, top + rowBytes));
+        pixels.copyWithin(top, bot, bot + rowBytes);
+        pixels.set(tmp, bot);
+    }
+
+    /* Copy into WASM heap */
+    Module.HEAPU8.set(pixels, pixPtr);
+    return 1;
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Web Worker Black Hole Renderer
+// ═══════════════════════════════════════════════════════════════════════
+
+var bhWorkers = [];
+var bhWorkerCount = 0;
+var bhWorkerPending = 0;
+var bhCurrentRequestId = 0;
+window.bhWorkerFrameReady = 0;
+
+function initBHWorkers() {
+    if (bhWorkers.length > 0) return;
+    bhWorkerCount = Math.min(navigator.hardwareConcurrency || 4, 8);
+    for (var i = 0; i < bhWorkerCount; i++) {
+        var w = new Worker('bh_worker.js');
+        w.onmessage = onBHWorkerResult;
+        bhWorkers.push(w);
+    }
+}
+
+function onBHWorkerResult(e) {
+    var d = e.data;
+    if (d.requestId !== bhCurrentRequestId) return; /* stale */
+
+    var lum = new Float32Array(d.lum);
+    var colR = new Float32Array(d.colR);
+    var colG = new Float32Array(d.colG);
+    var colB = new Float32Array(d.colB);
+
+    var stride = Module._get_lum_buf_stride();
+    var lumPtr = Module._get_lum_buf_ptr();
+    var rPtr = Module._get_col_r_ptr();
+    var gPtr = Module._get_col_g_ptr();
+    var bPtr = Module._get_col_b_ptr();
+
+    /* Write results into WASM heap row by row */
+    var hc = d.hc;
+    var idx = 0;
+    for (var sy = d.rowStart; sy < d.rowEnd; sy++) {
+        var off = (sy * stride); /* float offset into WASM heap */
+        for (var sx = 0; sx < hc; sx++) {
+            Module.HEAPF32[(lumPtr >> 2) + off + sx] = lum[idx];
+            Module.HEAPF32[(rPtr >> 2) + off + sx] = colR[idx];
+            Module.HEAPF32[(gPtr >> 2) + off + sx] = colG[idx];
+            Module.HEAPF32[(bPtr >> 2) + off + sx] = colB[idx];
+            idx++;
+        }
+    }
+
+    bhWorkerPending--;
+    if (bhWorkerPending <= 0) {
+        window.bhWorkerFrameReady = 1;
+        bhWorkerPending = 0;
+    }
+}
+
+window.dispatchBHWork = function(bhPtr, requestId, hr) {
+    initBHWorkers();
+    var p = readBHParams(bhPtr);
+    bhCurrentRequestId = requestId;
+    window.bhWorkerFrameReady = 0;
+
+    var rowsPerWorker = Math.ceil(hr / bhWorkerCount);
+    bhWorkerPending = 0;
+
+    for (var i = 0; i < bhWorkerCount; i++) {
+        var rowStart = i * rowsPerWorker;
+        var rowEnd = Math.min(rowStart + rowsPerWorker, hr);
+        if (rowStart >= hr) break;
+        bhWorkerPending++;
+        bhWorkers[i].postMessage({
+            cols: p.cols, rows: p.rows, hc: p.hc,
+            rowStart: rowStart, rowEnd: rowEnd,
+            camX: p.camX, camY: p.camY, camZ: p.camZ,
+            fwdX: p.fwdX, fwdY: p.fwdY, fwdZ: p.fwdZ,
+            rightX: p.rightX, rightY: p.rightY, rightZ: p.rightZ,
+            upX: p.upX, upY: p.upY, upZ: p.upZ,
+            ax: p.ax, ay: p.ay, diskTime: p.diskTime,
+            requestId: requestId
+        });
+    }
+};
+
+// Module must be defined BEFORE the Emscripten glue script loads
+var Module = {
+    print: function(text) { term.write(text + '\r\n'); },
+    printErr: function(text) { console.error(text); },
+    onRuntimeInitialized: function() {
+        Module._set_term_size(term.cols, term.rows);
+        term.onKey(function(e) {
+            var key = e.key;
+            for (var i = 0; i < key.length; i++) {
+                Module._push_key(key.charCodeAt(i));
+            }
+        });
+        window.addEventListener('resize', function() {
+            fitAddon.fit();
+            Module._set_term_size(term.cols, term.rows);
+        });
+    }
+};
+</script>
+<script src="viewer_web.js"></script>
+</body>
+</html>
