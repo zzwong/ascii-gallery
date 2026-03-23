@@ -59,14 +59,22 @@ var BH_FRAG_SRC = [
 'uniform vec2 u_fov;',
 'uniform vec2 u_cols_rows;',
 'uniform float u_disk_time;',
+'uniform int u_mode;', /* 0=black hole, 1=wormhole */
 '#define BH_RS 1.0',
 '#define R_ISCO 3.0',
 '#define R_OUTER 12.0',
+'#define WH_B0_SQ 0.25', /* 0.5^2 */
+'#define WH_R_INNER 2.0',
+'#define WH_R_OUTER 12.0',
 'vec3 blackbody(float temp){',
 '  temp=clamp(temp,0.0,1.0);',
 '  if(temp<0.33){float t=temp/0.33;return vec3(0.5+0.5*t,0.1*t*t,0.0);}',
 '  else if(temp<0.66){float t=(temp-0.33)/0.33;return vec3(1.0,0.1+0.7*t,0.05+0.3*t*t);}',
 '  else{float t=(temp-0.66)/0.34;return vec3(1.0-0.15*t,0.8+0.2*t,0.35+0.65*t);}',
+'}',
+'vec3 coolbody(float temp){',
+'  float t=clamp(temp,0.0,1.0);',
+'  return vec3(0.05+0.15*t, 0.2+0.5*t, 0.4+0.6*t);',
 '}',
 'void main(){',
 '  float sx=gl_FragCoord.x-0.5;',
@@ -78,20 +86,30 @@ var BH_FRAG_SRC = [
 '  vec3 dir=u_cam_fwd+u*u_fov.x*u_cam_right+v*u_fov.y*u_cam_up;',
 '  vec3 pos=u_cam_pos;',
 '  vec3 vel=normalize(dir);',
-'  float dt=0.25;',
+'  float dt=u_mode==1?0.2:0.25;',
+'  int maxSteps=u_mode==1?200:150;',
 '  float r=length(pos);',
+'  float r2=dot(pos,pos);',
 '  vec3 h=cross(pos,vel);',
-'  float f=-1.5*dot(h,h)/(r*r*r*r*r);',
+'  float h2=dot(h,h);',
+'  float shape=u_mode==1?(1.0-WH_B0_SQ/(r2+WH_B0_SQ)):1.0;',
+'  float f=-1.5*h2*shape/(r2*r2*r);',
 '  vec3 acc=f*pos/r;',
 '  vec3 total_color=vec3(0.0);',
 '  float total_lum=0.0;',
-'  for(int step=0;step<150;step++){',
+'  int side=0;',
+'  for(int step=0;step<200;step++){',
+'    if(step>=maxSteps)break;',
 '    float prev_y=pos.y;',
 '    pos+=vel*dt+0.5*acc*dt*dt;',
-'    r=length(pos);',
-'    if(r<BH_RS)break;',
+'    r2=dot(pos,pos);',
+'    r=sqrt(r2);',
+'    if(u_mode==0&&r<BH_RS)break;',
+'    if(u_mode==1&&r<0.01)r=0.01;',
 '    h=cross(pos,vel);',
-'    f=-1.5*dot(h,h)/(r*r*r*r*r);',
+'    h2=dot(h,h);',
+'    shape=u_mode==1?(1.0-WH_B0_SQ/(r2+WH_B0_SQ)):1.0;',
+'    f=-1.5*h2*shape/(r2*r2*r);',
 '    vec3 acc2=f*pos/r;',
 '    vel+=0.5*(acc+acc2)*dt;',
 '    acc=acc2;',
@@ -100,17 +118,21 @@ var BH_FRAG_SRC = [
 '      float cx=pos.x-vel.x*dt*(1.0-frac);',
 '      float cz=pos.z-vel.z*dt*(1.0-frac);',
 '      float cr=sqrt(cx*cx+cz*cz);',
-'      if(cr>=R_ISCO&&cr<=R_OUTER){',
-'        float brightness=sqrt(R_ISCO/cr);',
+'      float rInner=u_mode==1?WH_R_INNER:R_ISCO;',
+'      float rOuter=u_mode==1?WH_R_OUTER:R_OUTER;',
+'      if(cr>=rInner&&cr<=rOuter){',
+'        float brightness=sqrt(rInner/cr);',
 '        float phi=atan(cz,cx)+u_disk_time;',
 '        float doppler=1.0+0.35*sin(phi);',
 '        float band=0.85+0.15*sin(cr*3.0-u_disk_time*2.0);',
 '        float spiral=0.9+0.1*sin(phi*2.0-cr*0.8+u_disk_time*1.5);',
 '        float lum=clamp(brightness*doppler*band*spiral,0.0,1.0);',
 '        float temp=clamp(brightness+0.15*sin(phi),0.0,1.0);',
-'        total_color+=blackbody(temp)*lum;',
+'        vec3 diskColor=(u_mode==1&&mod(float(side),2.0)>=1.0)?coolbody(temp):blackbody(temp);',
+'        total_color+=diskColor*lum;',
 '        total_lum+=lum;',
 '        if(total_lum>1.5)break;',
+'        side++;',
 '      }',
 '    }',
 '    if(r>50.0)break;',
@@ -175,11 +197,12 @@ function readBHParams(ptr) {
     return p;
 }
 
-window.bhGpuRender = function(bhPtr, pixPtr) {
+window.bhGpuRender = function(bhPtr, pixPtr, mode) {
     if (!initBhGl()) return 0;
     var gl = bhGl;
     var p = readBHParams(bhPtr);
     var w = p.hc, h = p.rows * 3;
+    if (typeof mode === 'undefined') mode = 0;
 
     if (w !== bhPrevW || h !== bhPrevH) {
         gl.canvas.width = w;
@@ -206,6 +229,7 @@ window.bhGpuRender = function(bhPtr, pixPtr) {
     gl.uniform2f(u('u_fov'), p.ax, p.ay);
     gl.uniform2f(u('u_cols_rows'), p.cols, p.rows);
     gl.uniform1f(u('u_disk_time'), p.diskTime);
+    gl.uniform1i(u('u_mode'), mode);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, bhVBO);
     gl.enableVertexAttribArray(0);
